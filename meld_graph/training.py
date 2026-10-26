@@ -3,6 +3,7 @@ import os, psutil
 import torch
 import torch_geometric.data
 from meld_graph.dataset import GraphDataset, Oversampler
+from meld_graph.models import get_model_inputs
 import numpy as np
 from meld_graph.paths import EXPERIMENT_PATH
 from functools import partial
@@ -454,10 +455,14 @@ class Trainer:
         self.deep_supervision = self.params.get("deep_supervision", {"levels": [], "weight": []})
 
         init_weights = self.params.get("init_weights", None)
+        if init_weights is False:
+            init_weights = None
         if init_weights is not None:
             init_weights = os.path.join(EXPERIMENT_PATH, init_weights)
             assert os.path.isfile(init_weights), f"Weights file {init_weights} does not exist"
         self.init_weights = init_weights
+        # for ensemble checkpoints (e.g. MELD fold_all/best_model.pt): which fold model to start from
+        self.init_weights_ensemble_member = self.params.get("init_weights_ensemble_member", None)
 
     def train_epoch(self, data_loader, optimiser):
         """
@@ -487,7 +492,7 @@ class Trainer:
             data = data.to(device)
             model.train()
             optimiser.zero_grad()
-            estimates = model(data.x)
+            estimates = model(data.x, **get_model_inputs(data))
             labels = data.y.squeeze()
             distance_map = getattr(data, "distance_map", None)
             xyzr = getattr(data, "xyzr", None)
@@ -570,7 +575,7 @@ class Trainer:
             running_losses["loss"] = []
             for i, data in enumerate(data_loader):
                 data = data.to(device)
-                estimates = model(data.x)
+                estimates = model(data.x, **get_model_inputs(data))
                 labels = data.y.squeeze()
                 distance_map = getattr(data, "distance_map", None)
                 xyzr = getattr(data, "xyzr", None)
@@ -642,11 +647,26 @@ class Trainer:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         # load model if start epoch > 0
         if self.params.get("start_epoch", False):
+            # resume this experiment from its own epoch checkpoint
             self.init_weights = os.path.join(self.experiment.experiment_path, f"epoch_{self.params['start_epoch']}.pt")
-            self.experiment.load_model(checkpoint_path=self.init_weights)
-
-        self.experiment.load_model(checkpoint_path=self.init_weights)
+            self.experiment.load_model(checkpoint_path=None)
+            self.experiment.load_pretrained_weights(self.init_weights, allowed_missing_prefixes=())
+        else:
+            self.experiment.load_model(checkpoint_path=None)
+            if self.init_weights is not None:
+                # pretrained weights (single model or one member of an ensemble); new layers such as
+                # parcel_fusion.* keep their initialisation, everything else must match
+                self.experiment.load_pretrained_weights(
+                    self.init_weights, ensemble_member=self.init_weights_ensemble_member
+                )
         self.experiment.model.to(device)
+        if self.params.get("freeze_encoder", False):
+            if self.init_weights is None:
+                self.log.warning("freeze_encoder is set but no init_weights were given: the encoder stays random")
+            self.experiment.model.freeze_encoder()
+        n_trainable = sum(p.numel() for p in self.experiment.model.parameters() if p.requires_grad)
+        n_total = sum(p.numel() for p in self.experiment.model.parameters())
+        self.log.info(f"Trainable parameters: {n_trainable} / {n_total}")
         if wandb_logging:
             import wandb
 
@@ -688,12 +708,12 @@ class Trainer:
         # set up optimiser
         if self.params["optimiser"] == "adam":
             optimiser = torch.optim.Adam(
-                self.experiment.model.parameters(),
+                [p for p in self.experiment.model.parameters() if p.requires_grad],
                 **self.params["optimiser_parameters"],
             )
         elif self.params["optimiser"] == "sgd":
             optimiser = torch.optim.SGD(
-                self.experiment.model.parameters(),
+                [p for p in self.experiment.model.parameters() if p.requires_grad],
                 **self.params["optimiser_parameters"],
             )
         self.optimiser = optimiser

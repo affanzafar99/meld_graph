@@ -230,8 +230,8 @@ class Experiment:
                 num_features=num_features,
                 icosphere_params=icosphere_params,
             )
-        elif network_type == "MoNetUnet":
-            self.model = meld_graph.models.MoNetUnet(
+        elif network_type in ("MoNetUnet", "MoNetUnetParcelFusion"):
+            unet_kwargs = dict(
                 **self.network_parameters["model_parameters"],
                 num_features=num_features,
                 icosphere_params=icosphere_params,
@@ -244,11 +244,21 @@ class Experiment:
                 object_detection_head=self.network_parameters['training_parameters']['loss_dictionary']
                 .get('object_detection', {})
                 .get('apply_to_bottleneck', False),
-
-
             )
+            if network_type == "MoNetUnet":
+                self.model = meld_graph.models.MoNetUnet(**unet_kwargs)
+            else:
+                parcel_params = self.data_parameters.get("parcel_fusion")
+                if not parcel_params:
+                    raise ValueError("network_type 'MoNetUnetParcelFusion' needs data_parameters['parcel_fusion']")
+                self.model = meld_graph.models.MoNetUnetParcelFusion(
+                    **unet_kwargs,
+                    parcel_dim=parcel_params["parcel_dim"],
+                    n_parcels=parcel_params["n_parcels"],
+                    fusion_levels=parcel_params.get("fusion_levels"),
+                )
         else:
-            raise (NotImplementedError, network_type)
+            raise NotImplementedError(network_type)
 
         device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         if checkpoint_path is not None and os.path.isfile(checkpoint_path):
@@ -258,6 +268,44 @@ class Experiment:
             self.model.eval()
         elif checkpoint_path is not None:
             self.log.warn(f"Model checkpoing {checkpoint_path} does not exist!!!")
+        self.model.to(device)
+
+    def load_pretrained_weights(self, checkpoint_path, ensemble_member=None, allowed_missing_prefixes=("parcel_fusion.",)):
+        """
+        Load pretrained weights into the already built self.model, checking that every weight matched.
+
+        Works with single-model checkpoints and with ensemble checkpoints (e.g. the released MELD model
+        23-10-30_LVHZ_dcp/fold_all/best_model.pt, whose keys are "models.<k>.<param>").
+        For an ensemble, `ensemble_member` picks the fold model k to load.
+
+        Model weights whose names start with one of `allowed_missing_prefixes` (new modules that are not
+        in the checkpoint, e.g. the parcel fusion layers) keep their initialisation. Any other missing or
+        unexpected weight raises an error, so a silently half-loaded model is not possible.
+        """
+        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        state_dict = torch.load(checkpoint_path, map_location=device)
+        if any(key.startswith("models.") for key in state_dict):
+            n_members = len({key.split(".")[1] for key in state_dict if key.startswith("models.")})
+            if ensemble_member is None:
+                raise ValueError(
+                    f"{checkpoint_path} is an ensemble of {n_members} models. "
+                    "Set training_parameters['init_weights_ensemble_member'] to the fold model to start from."
+                )
+            prefix = f"models.{int(ensemble_member)}."
+            state_dict = {key[len(prefix):]: val for key, val in state_dict.items() if key.startswith(prefix)}
+            if len(state_dict) == 0:
+                raise ValueError(f"ensemble member {ensemble_member} not in {checkpoint_path} ({n_members} members)")
+            self.log.info(f"Loading ensemble member {ensemble_member} of {n_members} from {checkpoint_path}")
+        else:
+            self.log.info(f"Loading weights from {checkpoint_path}")
+        result = self.model.load_state_dict(state_dict, strict=False)
+        missing = [key for key in result.missing_keys if not key.startswith(tuple(allowed_missing_prefixes))]
+        if missing or result.unexpected_keys:
+            raise RuntimeError(
+                f"Pretrained weights do not match the model.\nmissing: {missing}\nunexpected: {result.unexpected_keys}"
+            )
+        new_keys = [key for key in result.missing_keys if key not in missing]
+        self.log.info(f"Loaded {len(state_dict)} pretrained tensors; {len(new_keys)} new tensors keep their initialisation")
         self.model.to(device)
 
     def load_ensemble_model(self, checkpoint_path=None, force=False):

@@ -10,11 +10,11 @@ class Ensemble(nn.Module):
         super(Ensemble, self).__init__()
         self.models = nn.ModuleList(models)
         
-    def forward(self, x):
+    def forward(self, x, **kwargs):
         """
-        Forward pass
+        Forward pass. Extra keyword inputs (e.g. parcel_vec, parcel_labels) are passed to every model.
         """
-        estimates = [model(x) for model in self.models]
+        estimates = [model(x, **kwargs) for model in self.models]
         ensembled_estimates = {}
         for key in ['log_softmax', 'hemi_log_softmax', 'non_lesion_logits','object_detection_linear']:
             if key not in estimates[0].keys():

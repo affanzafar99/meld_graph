@@ -99,7 +99,7 @@ class MoNet(nn.Module):
         elif activation_fn == "leaky_relu":
             self.activation_function = nn.LeakyReLU()
         else:
-            raise NotImplementedErrror("activation_fn: " + activation_fn)
+            raise NotImplementedError("activation_fn: " + activation_fn)
 
         self.icospheres = IcoSpheres(**icosphere_params)
         # NOTE to device call necessary here because icoshperes need to be on GPU during conv layer init
@@ -230,7 +230,7 @@ class MoNetUnet(nn.Module):
         elif activation_fn == "leaky_relu":
             self.activation_function = nn.LeakyReLU()
         else:
-            raise NotImplementedErrror("activation_fn: " + activation_fn)
+            raise NotImplementedError("activation_fn: " + activation_fn)
 
         self.icospheres = IcoSpheres(**icosphere_params)  # pseudo
         # NOTE to device call necessary here because icoshperes need to be on GPU during conv layer init
@@ -345,17 +345,41 @@ class MoNetUnet(nn.Module):
             self.distance_fc = nn.Linear(in_size, 1)
         self.fc = nn.Linear(in_size, 2)
 
+    # If True, each hemisphere in a batch is decoded with its own skip connections.
+    # The original MoNetUnet keeps one list for the whole batch, so hemispheres 2..B of a batch are
+    # decoded with the skip connections of hemisphere 1. Kept as False here so that the released
+    # MELD models behave exactly as before; MoNetUnetParcelFusion sets it to True.
+    reset_skips_per_sample = False
+
     def to(self, device, **kwargs):
         super(MoNetUnet, self).to(device, **kwargs)
         self.icospheres.to(device)
         self.device = device
 
-    def forward(self, data):
+    def freeze_encoder(self):
+        """Freeze all encoder conv layers (pooling layers have no parameters)."""
+        for param in self.encoder_conv_layers.parameters():
+            param.requires_grad_(False)
+
+    def _prepare_sample_inputs(self, batch_size, **kwargs):
+        """Split extra model inputs into one entry per hemisphere. Base model takes none."""
+        unexpected = [key for key, val in kwargs.items() if val is not None]
+        if unexpected:
+            raise TypeError(f"{type(self).__name__} does not take extra inputs {unexpected}. "
+                            "Use network_type 'MoNetUnetParcelFusion' for parcel fusion.")
+        return [None] * batch_size
+
+    def _decoder_block_hook(self, x, level, sample_inputs):
+        """Called after every decoder block (output at `level`). Identity in the base model."""
+        return x
+
+    def forward(self, data, **kwargs):
         batch_x = data
         # reshape input to batch,n_vertices
         original_shape = batch_x.shape
 
         batch_x = batch_x.view((batch_x.shape[0] // self.n_vertices, self.n_vertices, self.num_features))
+        per_sample_inputs = self._prepare_sample_inputs(batch_x.shape[0], **kwargs)
         skip_connections = []
         outputs = {"log_softmax": [], "non_lesion_logits": [], "log_sumexp": []}
         for level in self.deep_supervision:
@@ -366,7 +390,9 @@ class MoNetUnet(nn.Module):
             outputs['hemi_log_softmax'] = []
         if self.object_detection_head:
             outputs['object_detection_linear'] = []
-        for x in batch_x:
+        for b, x in enumerate(batch_x):
+            if self.reset_skips_per_sample:
+                skip_connections = []
             level = 7
             for i, block in enumerate(self.encoder_conv_layers):
                 for cl in block:
@@ -420,6 +446,7 @@ class MoNetUnet(nn.Module):
                 for cl in block:
                     x = cl(x, device=self.device)
                     x = self.activation_function(x)
+                x = self._decoder_block_hook(x, level, per_sample_inputs[b])
 
             # add distance head
             if self.distance_head:
@@ -448,6 +475,135 @@ class MoNetUnet(nn.Module):
                 shape = (-1,4)
             outputs[key] = torch.stack(output).view(shape)
         return outputs
+
+
+class GatedParcelFusion(nn.Module):
+    """
+    Residual gated spiral convolution that fuses decoder features with per-vertex parcel features.
+
+        z   = concat(h, p)                         (N_L, C + D)
+        f   = act(SpiralConv_f(z))                 feature branch (N_L, C)
+        g   = sigmoid(SpiralConv_g(z))             gate branch    (N_L, C)
+        out = h + scale * g * f
+
+    `scale` is a learnable per-channel vector initialised to 0, so at initialisation out == h and a
+    model loaded from pretrained MELD weights gives exactly the pretrained predictions. During training
+    `scale` moves away from 0 first, then gradients reach the feature and gate convolutions.
+
+    Args:
+        channels (int): C, number of decoder channels at this level (input and output).
+        parcel_dim (int): D, length of the parcel vector per parcel.
+        indices (torch.LongTensor): spiral indices for this icosphere level, shape (N_L, spiral_len).
+        activation_function (nn.Module): activation for the feature branch.
+    """
+
+    def __init__(self, channels, parcel_dim, indices, activation_function):
+        super(GatedParcelFusion, self).__init__()
+        self.channels = channels
+        self.parcel_dim = parcel_dim
+        self.feature_conv = SpiralConv(channels + parcel_dim, channels, indices=indices)
+        self.gate_conv = SpiralConv(channels + parcel_dim, channels, indices=indices)
+        self.scale = nn.Parameter(torch.zeros(channels))
+        self.activation_function = activation_function
+
+    def forward(self, h, p, device):
+        z = torch.cat([h, p], dim=1)
+        f = self.activation_function(self.feature_conv(z, device=device))
+        g = torch.sigmoid(self.gate_conv(z, device=device))
+        return h + self.scale * g * f
+
+
+class MoNetUnetParcelFusion(MoNetUnet):
+    """
+    MoNetUnet with Desikan-Killiany parcel vectors fused into the decoder by gated spiral convolution.
+
+    The encoder, decoder, heads and their parameter names are identical to MoNetUnet, so MELD weights
+    load directly. After each decoder block (output at level L) the per-subject parcel vector
+    (n_parcels, D) is mapped onto the vertices of level L via the DK vertex->parcel map and fused with
+    the block output by a GatedParcelFusion module (`parcel_fusion.<L>`).
+
+    Each hemisphere in a batch is decoded with its own skip connections (see reset_skips_per_sample).
+
+    Extra forward inputs (both as produced by GraphDataset and batched by torch_geometric):
+        parcel_vec (Tensor): (B * n_parcels, D) parcel vectors, one block of n_parcels rows per hemisphere.
+        parcel_labels (LongTensor): (B * n_vertices,) parcel index of every level-7 vertex per hemisphere,
+            after any mesh augmentation; value n_parcels means "no parcel" (zero vector).
+
+    Args:
+        parcel_dim (int): D.
+        n_parcels (int): number of parcels in the vectors (36 for FreeSurfer aparc order).
+        fusion_levels (list, optional): decoder levels to fuse at. Default: all decoder levels.
+        other args: as MoNetUnet.
+    """
+
+    reset_skips_per_sample = True
+    requires_parcel_inputs = True
+
+    def __init__(self, num_features, layer_sizes, parcel_dim=1, n_parcels=36, fusion_levels=None, spiral_len=7, **kwargs):
+        super(MoNetUnetParcelFusion, self).__init__(num_features, layer_sizes, spiral_len=spiral_len, **kwargs)
+        if self.conv_type != "SpiralConv":
+            raise NotImplementedError("MoNetUnetParcelFusion is only implemented for conv_type='SpiralConv'")
+        self.parcel_dim = parcel_dim
+        self.n_parcels = n_parcels
+        # output level of every decoder block, in decoder order (coarse -> fine), e.g. [2, 3, 4, 5, 6, 7]
+        bottom_level = 7 - (len(self.encoder_conv_layers) - 1)
+        self.decoder_levels = [bottom_level + 1 + j for j in range(len(self.decoder_conv_layers))]
+        if fusion_levels is None:
+            fusion_levels = self.decoder_levels
+        bad_levels = sorted(set(fusion_levels) - set(self.decoder_levels))
+        if bad_levels:
+            raise ValueError(f"fusion_levels {bad_levels} are not decoder levels {self.decoder_levels}")
+        self.fusion_levels = sorted(fusion_levels)
+        self.n_vertices_per_level = {
+            level: len(self.icospheres.icospheres[level]["coords"]) for level in self.icospheres.icospheres
+        }
+        fusions = {}
+        for j, level in enumerate(self.decoder_levels):
+            if level not in self.fusion_levels:
+                continue
+            channels = self.decoder_conv_layers[j][-1].out_channels
+            indices = self.icospheres.get_spirals(level=level)[:, :spiral_len]
+            fusions[str(level)] = GatedParcelFusion(channels, parcel_dim, indices, self.activation_function)
+        self.parcel_fusion = nn.ModuleDict(fusions)
+
+    def _prepare_sample_inputs(self, batch_size, parcel_vec=None, parcel_labels=None):
+        if parcel_vec is None or parcel_labels is None:
+            raise ValueError(
+                "MoNetUnetParcelFusion needs parcel_vec and parcel_labels. "
+                "Set data_parameters['parcel_fusion'] so that GraphDataset provides them, "
+                "and call the model as model(data.x, **get_model_inputs(data))."
+            )
+        parcel_vec = parcel_vec.view(batch_size, self.n_parcels, self.parcel_dim)
+        parcel_labels = parcel_labels.view(batch_size, self.n_vertices)
+        samples = []
+        for b in range(batch_size):
+            # extra zero row: vertices with label n_parcels (no parcel) map to a zero vector
+            padded = torch.cat([parcel_vec[b], parcel_vec.new_zeros(1, self.parcel_dim)], dim=0)
+            samples.append({"parcel_vec": padded, "parcel_labels": parcel_labels[b]})
+        return samples
+
+    def parcel_features_at_level(self, sample_inputs, level):
+        """Map this hemisphere's parcel vector onto the vertices of icosphere `level`: (N_level, D)."""
+        n_vert = self.n_vertices_per_level[level]
+        # icospheres are nested: the first n_vert level-7 vertices are the level-`level` vertices
+        return sample_inputs["parcel_vec"][sample_inputs["parcel_labels"][:n_vert]]
+
+    def _decoder_block_hook(self, x, level, sample_inputs):
+        key = str(level)
+        if key not in self.parcel_fusion:
+            return x
+        p = self.parcel_features_at_level(sample_inputs, level)
+        return self.parcel_fusion[key](x, p, device=self.device)
+
+
+def get_model_inputs(data):
+    """Extra keyword inputs for the model taken from a (batched) torch_geometric Data object."""
+    inputs = {}
+    for key in ("parcel_vec", "parcel_labels"):
+        val = getattr(data, key, None)
+        if val is not None:
+            inputs[key] = val
+    return inputs
 
 
 class HexPool(nn.Module):
@@ -528,6 +684,8 @@ class PredictionForSaliency(nn.Module):
         self.model = model
         
     def forward(self, input, mask=None):
+        if isinstance(self.model, MoNetUnetParcelFusion) or getattr(self.model, "requires_parcel_inputs", False):
+            raise NotImplementedError("Saliency is not implemented for MoNetUnetParcelFusion")
         prediction = torch.exp(self.model(input)['log_softmax'])
         if mask is None:
             prediction = torch.mean(prediction, axis=0)

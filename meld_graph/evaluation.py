@@ -4,7 +4,7 @@ import tempfile
 import torch
 import torch_geometric.data
 from meld_graph.dataset import GraphDataset
-from meld_graph.models import PredictionForSaliency
+from meld_graph.models import PredictionForSaliency, get_model_inputs
 import numpy as np
 import h5py
 import scipy
@@ -270,7 +270,7 @@ class Evaluator:
                     mask = torch.tensor(np.random.choice([0,1],data.x.shape, p=[self.dropout_p,1-self.dropout_p]), dtype=torch.bool)
                     x = torch.clone(data.x)
                     x[mask] = 0
-                    estimates = self.experiment.model(x)
+                    estimates = self.experiment.model(x, **get_model_inputs(data))
                     list_prediction.append(torch.exp(estimates["log_softmax"])[:, 1].detach().cpu())
                     # if distance_regression_flag:
                     list_distance_map.append(estimates["non_lesion_logits"][:, 0].detach().cpu())
@@ -280,7 +280,7 @@ class Evaluator:
                 # else:
                     # distance_map = torch.full((len(prediction), 1), torch.nan)[:, 0]
             else:
-                estimates = self.experiment.model(data.x)
+                estimates = self.experiment.model(data.x, **get_model_inputs(data))
                 prediction = torch.exp(estimates["log_softmax"])[:, 1].detach().cpu()
                 # get distance map if exist in loss, otherwise return array of NaN
                 # if (

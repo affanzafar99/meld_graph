@@ -5,6 +5,7 @@ from meld_graph.graph_tools import GraphTools
 
 from meld_graph.models import HexPool
 from meld_graph.augment import Augment
+from meld_graph.parcels import load_dk_vertex_labels, load_parcel_vectors
 import numpy as np
 import torch
 import logging
@@ -70,6 +71,13 @@ class GraphDataset(torch_geometric.data.Dataset):
             will be available as self.get().output_level<level>.
             Distance maps will be available as self.get().output_level<level>_distance_map.
         distance_mask_medial_wall (bool): mask of medial wall in distance maps to 300.
+
+    Parcel fusion (optional, params["parcel_fusion"] is a dict):
+        Loads <parcel_dir>/<subject_id>.npy for every subject (see meld_graph/parcels.py) and adds to
+        every data point:
+            parcel_vec (n_parcels, parcel_dim): the hemisphere's DK parcel vector
+            parcel_labels (n_vertices,): DK parcel index per level-7 vertex. It goes through the same
+                spinning / warping / flipping as the features, so parcels stay aligned with the data.
     """
 
     def __init__(
@@ -116,6 +124,18 @@ class GraphDataset(torch_geometric.data.Dataset):
             params=self.params["preprocessing_parameters"],
             icospheres=self.icospheres,
         )
+        # optional per-subject DK parcel vectors for MoNetUnetParcelFusion
+        self.parcel_params = self.params.get("parcel_fusion") or None
+        self.parcel_labels = None
+        if self.parcel_params:
+            if self.params["synthetic_data"]["run_synthetic"] or self.params.get("synth_on_the_fly", False):
+                raise NotImplementedError("parcel_fusion is not supported together with synthetic data")
+            if self.params["combine_hemis"] is not None:
+                raise NotImplementedError("parcel_fusion is not supported with combine_hemis")
+            self.parcel_labels = load_dk_vertex_labels(
+                self.parcel_params["n_parcels"], annot_file=self.parcel_params.get("annot_file")
+            )
+
         self.log.info(f"Loading and preprocessing {mode} data")
         self.log.debug(f"Combine hemis {self.params['combine_hemis']}")
 
@@ -170,6 +190,11 @@ class GraphDataset(torch_geometric.data.Dataset):
             else:
                 # add dists and smoothed labels
                 subject_data_list = self.add_smooth_label_and_dists(subject_data_list)
+                if self.parcel_params:
+                    # (2, n_parcels, parcel_dim), order lh, rh - same order as subject_data_list
+                    parcel_vecs = load_parcel_vectors(subj_id, self.parcel_params)
+                    for hemi_i, sdl in enumerate(subject_data_list):
+                        sdl["parcel_vec"] = parcel_vecs[hemi_i]
                 self.data_list.extend(subject_data_list)
 
         # dataset has weird properties. subject_ids needs to be the right length, matching the data length
@@ -255,6 +280,15 @@ class GraphDataset(torch_geometric.data.Dataset):
         """
         subject_data_dict = self.data_list[idx]
 
+        parcel_vec = None
+        if self.parcel_params:
+            # shallow copy so that the stored data point is not modified.
+            # parcel_vec is per parcel, not per vertex, so it must not go through the mesh augmentation;
+            # parcel_labels is per vertex and is augmented together with the features.
+            subject_data_dict = dict(subject_data_dict)
+            parcel_vec = subject_data_dict.pop("parcel_vec")
+            subject_data_dict["parcel_labels"] = self.parcel_labels
+
         #could consider adding synthetic lesions to control data here
         
         if self.params.get('synth_on_the_fly',False):
@@ -294,6 +328,10 @@ class GraphDataset(torch_geometric.data.Dataset):
                 labels_pooled[level] = self.pool_layers[level](labels_pooled[level + 1])
             for level in self.output_levels:
                 setattr(data, f"output_level{level}", labels_pooled[level])
+
+        if parcel_vec is not None:
+            data.parcel_vec = torch.tensor(parcel_vec, dtype=torch.float32)
+            data.parcel_labels = torch.as_tensor(subject_data_dict["parcel_labels"], dtype=torch.int64)
 
         # add  distance maps
         # clip distances
