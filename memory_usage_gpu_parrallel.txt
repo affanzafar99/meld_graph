@@ -4,4 +4,6 @@ Epoch 1 :: memory usage 4136.83203125MB-  time 26.80496048927307
  Epoch 2 :: memory usage 3962.5546875MB-  time 16.058279514312744 
  Epoch 1 :: memory usage 3815.15234375MB-  time 22.776932954788208 
  Epoch 2 :: memory usage 4095.453125MB-  time 22.55521845817566 
+ Epoch 1 :: memory usage 3747.65625MB-  time 32.17980241775513 
+ Epoch 1 :: memory usage 3914.65625MB-  time 39.099754095077515 
  

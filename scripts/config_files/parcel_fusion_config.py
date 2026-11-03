@@ -7,17 +7,18 @@
 #     model's own JSON files below, so the pretrained weights always fit
 #
 # Run from the repository root:
+#     python scripts/data_preparation/create_missing_parcel_vectors.py      # -1 files for hemispheres without lesion
 #     python scripts/classifier/check_parcel_fusion_inputs.py --config_file scripts/config_files/parcel_fusion_config.py
 #     python scripts/classifier/train_own_data.py --config_file scripts/config_files/parcel_fusion_config.py \
-#         --demographics_csv /home/affan/MSCS/data/my_data/demographics_testbatch_meld.csv
+#         --demographics_csv <meld_data_path>/my_data/demographics_testbatch_meld.csv
 
-import glob
 import json
 import os
 
-import numpy as np
+import torch
 
-from meld_graph.paths import EXPERIMENT_PATH, MELD_PARAMS_PATH
+from meld_graph.parcels import detect_parcel_dim
+from meld_graph.paths import EXPERIMENT_PATH, MELD_DATA_PATH, MELD_PARAMS_PATH
 
 # ---------------------------------------------------------------------------------------------
 # settings you are most likely to change
@@ -25,9 +26,12 @@ from meld_graph.paths import EXPERIMENT_PATH, MELD_PARAMS_PATH
 EXPERIMENT_NAME = "H5_parcel_fusion/s_0"  # saved to EXPERIMENT_PATH/<name>/fold_<fold_n>
 PRETRAINED = "23-10-30_LVHZ_dcp/fold_all"  # released MELD model, relative to EXPERIMENT_PATH
 PRETRAINED_FOLD_MODEL = 0  # which of the 5 fold models in the ensemble to start from (0-4)
-PARCEL_DIR = "/home/affan/MSCS/data/parcel_vectors"  # one <subject_id>.npy per subject, shape (2, 36[, D]), order lh, rh
+PARCEL_DIR = os.path.join(MELD_DATA_PATH, "my_data","parcel_vectors")
+# one file per hemisphere: <subject_id>_LH.npy and <subject_id>_RH.npy, shape (36,) or (36, D) each.
+# For one file per subject with shape (2, 36[, D]) (lh, rh) use "{subject_id}.npy".
+PARCEL_FILE_PATTERN = "{subject_id}_{hemi}.npy"
 N_EPOCHS = 2
-BATCH_SIZE = 2  # 2 fits in RAM on CPU; MELD's standard is 8 on GPU
+BATCH_SIZE = 8 if torch.cuda.is_available() else 2  # MELD's standard 8 on GPU; 2 fits in RAM on CPU
 FUSION_LEVELS = None  # decoder levels to fuse at; None = all (2-7). e.g. [2, 3, 4, 5, 6] skips the 163842-vertex level
 
 
@@ -50,14 +54,6 @@ if not os.path.isfile(_zscore):
         f"z-score file of the released model not found: {os.path.normpath(_zscore)}. "
         f"It is listed in {os.path.join(_pretrained_dir, 'data_parameters.json')}."
     )
-
-
-def _detect_parcel_dim(parcel_dir):
-    files = sorted(glob.glob(os.path.join(parcel_dir, "*.npy")))
-    if not files:
-        raise FileNotFoundError(f"No .npy parcel vector files in {parcel_dir}")
-    arr = np.load(files[0], mmap_mode="r")
-    return 1 if arr.ndim == 2 else int(arr.shape[-1])
 
 
 _pre_training = PRETRAINED_NETWORK_PARAMETERS["training_parameters"]
@@ -129,8 +125,9 @@ data_parameters = {
     # ---- per-subject DK parcel vectors (see meld_graph/parcels.py)
     "parcel_fusion": {
         "parcel_dir": PARCEL_DIR,
+        "file_pattern": PARCEL_FILE_PATTERN,
         "n_parcels": 36,  # FreeSurfer aparc colour-table order of fsaverage_sym/label/lh.aparc.annot
-        "parcel_dim": _detect_parcel_dim(PARCEL_DIR),  # numbers per parcel, read from your first .npy file
+        "parcel_dim": detect_parcel_dim(PARCEL_DIR, PARCEL_FILE_PATTERN),  # numbers per parcel, read from your first file
         "fusion_levels": FUSION_LEVELS,
         "missing_subject": "error",  # or "zeros"
         "annot_file": None,  # default: MELD_PARAMS_PATH/fsaverage_sym/label/lh.aparc.annot

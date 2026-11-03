@@ -10,6 +10,17 @@
 #     MELD_PARAMS_PATH = <meld_data_path>/meld_params                     (fsaverage_sym, z-score file via ../)
 #
 # Lines marked  # <-- SET  depend on your data.
+# Paths are built from meld_config.ini, so this config works unchanged on any machine with the same
+# folder layout under <meld_data_path>.
+
+import os
+
+import torch
+
+from meld_graph.paths import EXPERIMENT_PATH
+
+# hemispheres per batch: MELD's standard 8 on a GPU; 2 on CPU (8 ran out of RAM on the laptop)
+BATCH_SIZE = 8 if torch.cuda.is_available() else 2
 
 network_parameters = {
     # experiment folder: EXPERIMENT_PATH/<name>/fold_<fold_n>
@@ -46,8 +57,7 @@ network_parameters = {
         "optimiser_parameters": {"lr": 0.0001, "momentum": 0.99, "nesterov": True},
         "lr_decay": 0.9,  # lr * (1 - epoch / max_epochs_lr_decay) ** lr_decay ; 0 = off
         "max_epochs_lr_decay": 3,
-        # hemispheres per batch. MELD's standard is 8 (GPU); 2 fits in RAM on CPU (8 was killed out of memory)
-        "batch_size": 2,
+        "batch_size": BATCH_SIZE,
         "shuffle_each_epoch": True,
         # oversampling: every epoch = all lesional hemispheres + 2x as many random ones
         "oversampling": True,
@@ -127,7 +137,7 @@ data_parameters = {
         # JSON with {"<feature>": {"mean": .., "std": ..}} for every feature above.
         # Relative paths are joined to MELD_PARAMS_PATH; an absolute path is used as is.
         # computed from all your trainval subjects with test_run_own_data.py --write_zscore
-        "zscore": "/home/affan/MSCS/data/models/feature_means_H5_trainval.json",
+        "zscore": os.path.join(EXPERIMENT_PATH, "feature_means_H5_trainval.json"),
     },
     "combine_hemis": None,  # None = each hemisphere is one sample
     "distance_mask_medial_wall": True,  # medial wall = max distance (300) in distance maps

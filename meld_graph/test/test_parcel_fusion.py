@@ -17,7 +17,7 @@ import torch
 import torch_geometric
 
 from meld_graph.models import MoNetUnet, MoNetUnetParcelFusion, get_model_inputs
-from meld_graph.parcels import map_parcels_to_vertices
+from meld_graph.parcels import detect_parcel_dim, load_parcel_vectors, map_parcels_to_vertices, read_annot_parcels
 from meld_graph.experiment import Experiment
 from meld_graph.augment import Augment
 
@@ -205,3 +205,57 @@ def test_augmentation_keeps_parcels_aligned():
         out = Augment.apply_indices(None, indices, dict(tdd))
         np.testing.assert_array_equal(out["features"][:, 0], out["parcel_labels"].astype(np.float32))
         assert not np.array_equal(out["parcel_labels"], parcel_labels)
+
+
+def test_read_annot_parcels_uses_positions(tmp_path):
+    """Colour tables numbered like FreeSurferColorLUT (1000+) must still give parcel positions 0..n-1."""
+    import struct
+
+    def be(*v):
+        return struct.pack(">" + "i" * len(v), *v)
+
+    def s(x):
+        b = x.encode() + b"\x00"
+        return be(len(b)) + b
+
+    names = ["unknown", "bankssts", "caudalanteriorcingulate", "precentral"]
+    rgb = [(25, 5, 25), (25, 100, 40), (125, 100, 160), (60, 20, 220)]
+    colours = [r + g * 256 + b * 65536 for r, g, b in rgb]
+    parcels = [0, 1, 1, 2, 3, 3, 3, 0, 0, 0]
+    values = [colours[p] for p in parcels]
+    values[-1] = 0  # vertex without parcel
+    blob = be(len(values)) + b"".join(be(i, v) for i, v in enumerate(values))
+    blob += be(1) + be(-2) + be(1025) + s("/x/FreeSurferColorLUT.txt") + be(len(names))
+    for table_id, name, (r, g, b) in zip([1000, 1001, 1002, 1024], names, rgb):
+        blob += be(table_id) + s(name) + be(r, g, b, 0)
+    path = tmp_path / "lh.aparc.annot"
+    path.write_bytes(blob)
+
+    positions, read_names, table_ids = read_annot_parcels(str(path))
+    assert read_names == names
+    assert table_ids == [1000, 1001, 1002, 1024]
+    assert positions.tolist() == [0, 1, 1, 2, 3, 3, 3, 0, 0, -1]
+
+
+@pytest.mark.parametrize("parcel_dim", [1, 3])
+def test_load_parcel_vectors_one_file_per_hemisphere(tmp_path, parcel_dim):
+    """<subject>_LH.npy / _RH.npy are stacked to (2, 36, D) with lh first."""
+    shape = (N_PARCELS,) if parcel_dim == 1 else (N_PARCELS, parcel_dim)
+    lh = np.full(shape, 1.0, dtype=np.float32)
+    rh = np.full(shape, -1.0, dtype=np.float32)
+    np.save(tmp_path / "SUBJ_LH.npy", lh)
+    np.save(tmp_path / "SUBJ_RH.npy", rh)
+    params = {"parcel_dir": str(tmp_path), "file_pattern": "{subject_id}_{hemi}.npy",
+              "n_parcels": N_PARCELS, "parcel_dim": parcel_dim}
+
+    assert detect_parcel_dim(str(tmp_path), params["file_pattern"]) == parcel_dim
+    vec = load_parcel_vectors("SUBJ", params)
+    assert vec.shape == (2, N_PARCELS, parcel_dim)
+    assert np.all(vec[0] == 1.0) and np.all(vec[1] == -1.0)
+
+    # a missing hemisphere file is an error by default, zeros if asked
+    (tmp_path / "SUBJ_RH.npy").unlink()
+    with pytest.raises(FileNotFoundError):
+        load_parcel_vectors("SUBJ", params)
+    zeros = load_parcel_vectors("SUBJ", dict(params, missing_subject="zeros"))
+    assert zeros.shape == (2, N_PARCELS, parcel_dim) and not zeros.any()

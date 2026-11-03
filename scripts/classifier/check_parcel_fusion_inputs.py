@@ -17,10 +17,10 @@ import os
 import sys
 
 import h5py
-import nibabel as nb
 import numpy as np
 import pandas as pd
 
+from meld_graph.parcels import load_parcel_vectors, parcel_file_paths, read_annot_parcels
 from meld_graph.paths import BASE_PATH, DK_ATLAS_FILE, EXPERIMENT_PATH, MELD_PARAMS_PATH, load_config
 
 
@@ -56,7 +56,8 @@ def main():
     print(f"  model {net['network_type']}, start from {tp['init_weights']} (fold model {tp['init_weights_ensemble_member']}), "
           f"freeze_encoder={tp['freeze_encoder']}")
     print(f"  {len(dp['features'])} input features, z-score file {dp['preprocessing_parameters']['zscore']}")
-    print(f"  parcel vectors: {pf['parcel_dir']}, n_parcels={pf['n_parcels']}, parcel_dim={pf['parcel_dim']}")
+    print(f"  parcel vectors: {pf['parcel_dir']}, files {pf.get('file_pattern', '{subject_id}.npy')}, "
+          f"n_parcels={pf['n_parcels']}, parcel_dim={pf['parcel_dim']}")
 
     # ---- 1. z-score file covers every feature
     import json
@@ -73,13 +74,14 @@ def main():
     if not os.path.isfile(annot):
         errors.append(f"DK annotation not found: {annot}")
     else:
-        labels, _, names = nb.freesurfer.read_annot(annot)
-        names = [n.decode() if isinstance(n, bytes) else n for n in names]
+        labels, names, table_ids = read_annot_parcels(annot)
         counts = np.bincount(labels[labels >= 0], minlength=len(names))
         if len(names) != pf["n_parcels"]:
             errors.append(f"{annot} has {len(names)} parcels, config says n_parcels={pf['n_parcels']}")
+        print("  position  name                         vertices   (number in the annot colour table)")
         for i, name in enumerate(names):
-            print(f"  {i:2d} {name:28s} {counts[i]:6d} vertices" + ("   (no vertices: value is unused)" if counts[i] == 0 else ""))
+            print(f"  {i:8d}  {name:28s} {counts[i]:8d}   ({table_ids[i]})"
+                  + ("   no vertices: this value is unused" if counts[i] == 0 else ""))
         n_none = int((labels < 0).sum())
         if n_none:
             print(f"  -- {n_none} vertices have no parcel and get a zero vector")
@@ -95,21 +97,17 @@ def main():
     expected_shape = (2, pf["n_parcels"], pf["parcel_dim"])
     missing, bad, arrays = [], [], []
     for subj in used["subject_id"]:
-        path = os.path.join(pf["parcel_dir"], f"{subj}.npy")
-        if not os.path.isfile(path):
-            missing.append(subj)
+        absent = [os.path.basename(p) for p in parcel_file_paths(subj, pf) if not os.path.isfile(p)]
+        if absent:
+            missing.append(", ".join(absent))
             continue
-        arr = np.load(path)
-        if arr.ndim == 2:
-            arr = arr[:, :, None]
-        if arr.shape != expected_shape:
-            bad.append(f"{subj}: shape {arr.shape}, expected {expected_shape}")
-        elif not np.all(np.isfinite(arr)):
-            bad.append(f"{subj}: contains NaN or inf")
-        else:
-            arrays.append(arr)
+        try:  # the same loading code training uses
+            arrays.append(load_parcel_vectors(subj, pf))
+        except ValueError as e:
+            bad.append(str(e))
     if missing:
-        msg = f"{len(missing)} subjects have no parcel vector file, e.g. {missing[:5]}"
+        msg = (f"{len(missing)} subjects have missing parcel vector files, e.g. {missing[:5]} "
+               "(for hemispheres without lesion: scripts/data_preparation/create_missing_parcel_vectors.py)")
         (warnings if pf.get("missing_subject") == "zeros" else errors).append(msg)
     if bad:
         errors.append(f"{len(bad)} parcel vector files are invalid, e.g. {bad[:5]}")
