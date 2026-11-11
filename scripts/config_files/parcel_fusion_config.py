@@ -23,14 +23,14 @@ from meld_graph.paths import EXPERIMENT_PATH, MELD_DATA_PATH, MELD_PARAMS_PATH
 # ---------------------------------------------------------------------------------------------
 # settings you are most likely to change
 # ---------------------------------------------------------------------------------------------
-EXPERIMENT_NAME = "H5_parcel_fusion/s_0"  # saved to EXPERIMENT_PATH/<name>/fold_<fold_n>
+EXPERIMENT_NAME = "parcel_fusion/run1"  # saved to EXPERIMENT_PATH/<name>/fold_<fold_n>
 PRETRAINED = "23-10-30_LVHZ_dcp/fold_all"  # released MELD model, relative to EXPERIMENT_PATH
 PRETRAINED_FOLD_MODEL = 0  # which of the 5 fold models in the ensemble to start from (0-4)
 PARCEL_DIR = os.path.join(MELD_DATA_PATH, "my_data","parcel_vectors")
 # one file per hemisphere: <subject_id>_LH.npy and <subject_id>_RH.npy, shape (36,) or (36, D) each.
 # For one file per subject with shape (2, 36[, D]) (lh, rh) use "{subject_id}.npy".
 PARCEL_FILE_PATTERN = "{subject_id}_{hemi}.npy"
-N_EPOCHS = 2
+N_EPOCHS = 200
 BATCH_SIZE = 8 if torch.cuda.is_available() else 2  # MELD's standard 8 on GPU; 2 fits in RAM on CPU
 FUSION_LEVELS = None  # decoder levels to fuse at; None = all (2-7). e.g. [2, 3, 4, 5, 6] skips the 163842-vertex level
 
@@ -78,7 +78,7 @@ network_parameters = {
         # the training loop starts at epoch 1, so num_epochs = N_EPOCHS + 1 trains N_EPOCHS epochs
         "num_epochs": N_EPOCHS + 1,
         "max_epochs_lr_decay": N_EPOCHS + 1,
-        "max_patience": 1000,
+        "max_patience": 50,
         "batch_size": BATCH_SIZE,
         "start_epoch": 0,
         # start from one fold model of the released ensemble, freeze its encoder
@@ -91,8 +91,30 @@ network_parameters = {
 data_parameters = {
     # ---- your data (same as my_train_config.py)
     "hdf5_file_root": "{site_code}_{group}_featurematrix_combat.hdf5",
-    "dataset": "split_testbatch.csv",  # in BASE_PATH
-    "site_codes": ["H5"],
+    "dataset": "MELD_dataset_V6.csv",  # in BASE_PATH
+    "site_codes": [
+        "H1",
+        "H2",
+        "H3",
+        "H4",
+        "H5",
+        "H6",
+        "H7",
+        "H9",
+        "H10",
+        "H11",
+        "H12",
+        "H14",
+        "H15",
+        "H16",
+        "H17",
+        "H18",
+        "H19",
+        "H21",
+        "H23",
+        "H24",
+        "H26",
+    ],
     "scanners": ["15T", "3T", "XT"],
     "group": "both",
     "subject_features_to_exclude": [],
